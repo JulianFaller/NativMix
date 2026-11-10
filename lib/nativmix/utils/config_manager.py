@@ -371,6 +371,30 @@ class ConfigManager(QObject):
         self._data.setdefault("settings", {})["profile_midi_prev_cc"] = cc
         self.settings_changed.emit()
 
+    @property
+    def midi_action_mappings(self) -> list[dict[str, Any]]:
+        """Generic MIDI button actions: [{cc, midi_channel, action}]."""
+        raw = self._data.get("settings", {}).get("midi_action_mappings", [])
+        return [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+
+    @midi_action_mappings.setter
+    def midi_action_mappings(self, mappings: list[dict[str, Any]]) -> None:
+        clean = []
+        for row in mappings:
+            try:
+                cc = int(row["cc"])
+                midi_channel = max(0, min(15, int(row.get("midi_channel", 0))))
+                action = str(row["action"])
+                slot = max(0, min(5, int(row.get("slot", len(clean)))))
+            except (KeyError, TypeError, ValueError):
+                continue
+            valid_action = action in {"media_stop", "media_next", "media_previous", "media_play_pause"} or action.startswith("key:")
+            if 0 <= cc <= 127 and valid_action:
+                clean.append({"cc": cc, "midi_channel": midi_channel, "action": action, "slot": slot})
+        self._data.setdefault("settings", {})["midi_action_mappings"] = clean
+        self.save()
+        self.settings_changed.emit()
+
     def _migrate(self) -> None:
         """Apply forward migrations when the config version increases."""
         version = self._data.get("version", 0)

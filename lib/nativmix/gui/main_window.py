@@ -2267,8 +2267,8 @@ class MainWindow(QMainWindow):
         Central Learn handshake for both volume-CC and mute-CC.
         Iterates all channels and acts on the first one that is in learn mode.
         A single break ensures one CC event never assigns to multiple channels.
-        Mute-CC learn only captures on value==127 (button press) so fader
-        movements cannot accidentally complete the learn.
+        Mute-CC learn captures a non-zero button value. This supports
+        controllers that send 1/0 as well as the usual 127/0.
         """
         # Crossfader bar Learn takes precedence over per-channel learn so the
         # same CC event never also assigns to a channel.
@@ -2295,7 +2295,7 @@ class MainWindow(QMainWindow):
                     widget.channel_index,
                 )
                 break
-            if widget.is_waiting_for_mute_learn() and value == 127:
+            if widget.is_waiting_for_mute_learn() and value > 0:
                 self._config.set_midi_mute_cc(widget.channel_index, control_number, midi_channel=midi_channel)
                 widget.update_midi_mute_cc(control_number, midi_channel=midi_channel)
                 logger.debug(

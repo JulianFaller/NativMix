@@ -123,6 +123,7 @@ class MidiThread(QThread):
     profile_switch_requested = pyqtSignal(str)  # "next", "prev", or profile_id
     fader_sync_requested = pyqtSignal(list)  # list[tuple[int, float]] (channel, volume)
     mute_feedback_requested = pyqtSignal(list)  # list[tuple[int, bool]] (channel, muted)
+    midi_action_triggered = pyqtSignal(str)
 
     def __init__(self, device_name: str = "", input_mode: str = "hybrid", parent=None) -> None:
         super().__init__(parent)
@@ -137,6 +138,7 @@ class MidiThread(QThread):
         self._mute_cc_map: dict[tuple[int, int], int] = {}
         self._map_lock = threading.RLock()
         self._last_values: dict[tuple[int, int], int] = {}
+        self._last_button_values: dict[tuple[int, int], int] = {}
         # Coalesces CC volume bursts to 50 Hz per binding while guaranteeing
         # the trailing value of a burst is flushed (see #39).
         self._cc_throttler = CcVolumeThrottler(0.02)
@@ -146,6 +148,7 @@ class MidiThread(QThread):
         self._profile_next_cc: int | None = None
         self._profile_prev_cc: int | None = None
         self._profile_direct_map: dict[int, str] = {}  # cc -> profile_id
+        self._action_map: dict[tuple[int, int], str] = {}
         self._fader_feedback_enabled: bool = False
         self._feedback_lock = threading.Lock()
         self._feedback_takeover: dict[int, float] = {}  # channel_index -> last sent volume
@@ -250,6 +253,15 @@ class MidiThread(QThread):
             prev_cc,
             direct_map,
         )
+
+    def set_action_mappings(self, mappings: list[dict]) -> None:
+        """Replace generic button action mappings keyed by MIDI channel and CC."""
+        self._action_map = {
+            (max(0, min(15, int(row.get("midi_channel", 0)))), int(row["cc"])): str(row["action"])
+            for row in mappings
+            if isinstance(row, dict) and row.get("cc") is not None and row.get("action")
+        }
+        logger.info("[MIDI action map] active bindings: %s", self._action_map)
 
     def get_mapped_volumes(self) -> list[tuple[int, float]]:
         """Return a list of (channel_index, volume) for all current mappings."""
@@ -648,7 +660,12 @@ class MidiThread(QThread):
         """Process a single MIDI Control Change message on *midi_ch* (0-15)."""
         midi_ch = max(0, min(15, int(midi_ch)))
         key = (midi_ch, cc)
+        previous_value = self._last_button_values.get(key, 0)
+        self._last_button_values[key] = val
         self._last_values[key] = val
+        # Button controllers use either 127/0 or 1/0 for press/release.
+        # Trigger mapped actions once on the rising edge in both formats.
+        button_pressed = val > 0 and previous_value == 0
 
         # 1. Always emit for Learn handshake
         self.midi_cc_received.emit(midi_ch, cc, val)
@@ -670,8 +687,8 @@ class MidiThread(QThread):
             if to_emit:
                 self.midi_volumes_changed.emit(to_emit)
 
-        # 3. Mute toggle (value == 127 only). Suppress echoes of our own outbound.
-        if val == 127:
+        # 3. Mute toggle on button press; accepts 1/0 and 127/0 controllers.
+        if button_pressed:
             with self._map_lock:
                 mute_ch = self._mute_cc_map.get(key)
             if mute_ch is not None:
@@ -680,8 +697,18 @@ class MidiThread(QThread):
                 if time.monotonic() >= until:
                     self.midi_mute_toggled.emit(mute_ch)
 
-        # 4. Profile switching (only on button press, value == 127)
-        if val == 127:
+        # 4. Profile switching on button press, regardless of press value.
+        if button_pressed:
+            action = self._action_map.get(key)
+            logger.info(
+                "[MIDI button] press channel=%d cc=%d value=%d mapped_action=%r",
+                midi_ch + 1,
+                cc,
+                val,
+                action,
+            )
+            if action:
+                self.midi_action_triggered.emit(action)
             if cc == self._profile_next_cc:
                 self.profile_switch_requested.emit("next")
             elif cc == self._profile_prev_cc:

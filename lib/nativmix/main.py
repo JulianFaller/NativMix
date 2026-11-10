@@ -15,8 +15,10 @@ import logging
 import os
 import pathlib
 import platform
+import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -697,12 +699,110 @@ def main() -> None:
             config.profile_midi_prev_cc,
             profile_manager.direct_cc_map,
         )
+        midi.set_action_mappings(config.midi_action_mappings)
         midi.set_fader_feedback_enabled(config.midi_fader_feedback)
         _push_midi_fader_feedback()
         _push_midi_mute_feedback()
 
     config.settings_changed.connect(_on_settings_changed)
     _on_settings_changed()  # initialize MIDI CCs and Arduino from startup profile
+
+    def _run_midi_action(action: str) -> None:
+        """Run a learned Linux media action or keyboard shortcut."""
+        logger.info("[MIDI action] received action=%r", action)
+        media_commands = {
+            "media_stop": "stop",
+            "media_next": "next",
+            "media_previous": "previous",
+            "media_play_pause": "play-pause",
+        }
+        if action in media_commands:
+            if not shutil.which("playerctl"):
+                logger.warning("MIDI media action requires playerctl")
+                return
+            try:
+                logger.info("[MIDI action] launching playerctl %s", media_commands[action])
+                subprocess.Popen(
+                    ["playerctl", media_commands[action]],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                logger.exception("MIDI media action failed: %s", action)
+            return
+        if action.startswith("key:"):
+            keys = action[4:].strip().lower().split("+")
+            if not keys:
+                return
+            try:
+                if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wtype"):
+                    modifiers = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift", "meta": "logo", "super": "logo"}
+                    args = ["wtype"]
+                    held = [modifiers[key] for key in keys[:-1] if key in modifiers]
+                    for mod in held:
+                        args.extend(["-M", mod])
+                    args.append(keys[-1])
+                    for mod in reversed(held):
+                        args.extend(["-m", mod])
+                elif shutil.which("xdotool"):
+                    args = ["xdotool", "key", "+".join(keys)]
+                else:
+                    logger.warning("Keyboard shortcuts need wtype (Wayland) or xdotool (X11)")
+                    return
+                logger.info("[MIDI action] launching keyboard command: %s", args)
+                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                logger.exception("MIDI keyboard shortcut failed: %s", action)
+
+    midi.midi_action_triggered.connect(_run_midi_action)
+
+    _midi_action_learn_slot: int | None = None
+    _midi_action_learn_action: str | None = None
+
+    def _start_midi_action_learn(slot: int, action: str, _shortcut: str) -> None:
+        nonlocal _midi_action_learn_slot, _midi_action_learn_action
+        if not action:
+            _midi_action_learn_slot = None
+            _midi_action_learn_action = None
+            config.midi_action_mappings = [m for m in config.midi_action_mappings if int(m.get("slot", -1)) != slot]
+            window.settings_panel.update_midi_action_mappings(config.midi_action_mappings)
+            return
+        _midi_action_learn_slot = slot
+        _midi_action_learn_action = action
+        logger.info("[MIDI action learn] waiting for button slot=%d action=%r", slot, action)
+
+    def _capture_midi_action(midi_channel: int, cc: int, value: int) -> None:
+        nonlocal _midi_action_learn_slot, _midi_action_learn_action
+        if _midi_action_learn_slot is None or value <= 0:
+            return
+        slot = _midi_action_learn_slot
+        _midi_action_learn_slot = None
+        action = _midi_action_learn_action or ""
+        _midi_action_learn_action = None
+        rows = [m for m in config.midi_action_mappings if int(m.get("slot", -1)) != slot]
+        rows.append({"slot": slot, "cc": cc, "midi_channel": midi_channel, "action": action})
+        config.midi_action_mappings = rows
+        window.settings_panel.update_midi_action_mappings(config.midi_action_mappings)
+        logger.info(
+            "[MIDI action learn] learned slot=%d channel=%d cc=%d action=%r",
+            slot,
+            midi_channel + 1,
+            cc,
+            action,
+        )
+
+    class _MidiActionLearnBridge(QObject):
+        """Queue MIDI learn callbacks onto the GUI thread."""
+
+        @pyqtSlot(int, int, int)
+        def capture(self, midi_channel: int, cc: int, value: int) -> None:
+            _capture_midi_action(midi_channel, cc, value)
+
+    _midi_action_learn_bridge = _MidiActionLearnBridge(window)
+    window.settings_panel.midi_action_learn_started.connect(_start_midi_action_learn)
+    midi.midi_cc_received.connect(_midi_action_learn_bridge.capture)
+    window.settings_panel.update_midi_action_mappings(config.midi_action_mappings)
 
     def _on_channel_volume_midi_feedback(channel_index: int, volume: float) -> None:
         if config.get_midi_cc(channel_index) is not None:
@@ -1242,8 +1342,6 @@ def main() -> None:
     if _do_restart:
         # Systemd service: delegate restart so the new process starts in the correct cgroup.
         if is_systemd_service():
-            import subprocess
-
             logger.info("Restarting via systemctl (systemd service detected)")
             try:
                 subprocess.run(

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import serial.tools.list_ports
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QMouseEvent, QStandardItem
+from PyQt6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QStandardItem
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QLineEdit,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -44,6 +45,106 @@ from nativmix.utils.paths import is_flatpak, is_windows
 from nativmix.utils.qt_utils import _slot_guard
 
 logger = logging.getLogger(__name__)
+
+
+class _ShortcutEdit(QLineEdit):
+    """Capture one key plus modifiers and show it as a portable shortcut."""
+
+    shortcut_changed = pyqtSignal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._held_modifiers = 0
+        self.setPlaceholderText("Press shortcut…")
+        self.setReadOnly(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = int(event.key())
+        modifier_value = event.modifiers().value
+        modifiers = (
+            (Qt.KeyboardModifier.ControlModifier, "Ctrl"),
+            (Qt.KeyboardModifier.AltModifier, "Alt"),
+            (Qt.KeyboardModifier.ShiftModifier, "Shift"),
+            (Qt.KeyboardModifier.MetaModifier, "Meta"),
+        )
+        modifier_keys = {
+            Qt.Key.Key_Control.value: "Ctrl",
+            Qt.Key.Key_Alt.value: "Alt",
+            Qt.Key.Key_Shift.value: "Shift",
+            Qt.Key.Key_Meta.value: "Meta",
+        }
+        if key in modifier_keys:
+            modifier_for_key = {
+                Qt.Key.Key_Control.value: Qt.KeyboardModifier.ControlModifier.value,
+                Qt.Key.Key_Alt.value: Qt.KeyboardModifier.AltModifier.value,
+                Qt.Key.Key_Shift.value: Qt.KeyboardModifier.ShiftModifier.value,
+                Qt.Key.Key_Meta.value: Qt.KeyboardModifier.MetaModifier.value,
+            }
+            self._held_modifiers |= modifier_for_key[key]
+            held = [name for flag, name in modifiers if modifier_value & flag.value]
+            if not held:
+                held = [modifier_keys[key]]
+            self.setPlaceholderText(" + ".join(held or [modifier_keys[key]]) + " + …")
+            logger.info(
+                "[MIDI shortcut capture] modifier down key=%s event_modifiers=%s held=%s",
+                modifier_keys[key],
+                modifier_value,
+                self._held_modifiers,
+            )
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape.value:
+            self.clear()
+            self.shortcut_changed.emit("")
+            event.accept()
+            return
+        if key == Qt.Key.Key_unknown.value:
+            event.accept()
+            return
+        chord = key | modifier_value | self._held_modifiers
+        shortcut = QKeySequence(chord).toString(QKeySequence.SequenceFormat.PortableText)
+        logger.info(
+            "[MIDI shortcut capture] key=%s event_modifiers=%s held=%s chord=%s result=%r",
+            key,
+            modifier_value,
+            self._held_modifiers,
+            chord,
+            shortcut,
+        )
+        if not shortcut:
+            self.setPlaceholderText("Shortcut not recognized — try again")
+            event.accept()
+            return
+        self.setText(shortcut)
+        self._held_modifiers = 0
+        self.setPlaceholderText("Press shortcut…")
+        self.shortcut_changed.emit(shortcut)
+        logger.info("[MIDI shortcut capture] field now contains %r", self.text())
+        event.accept()
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (
+            Qt.Key.Key_Control.value,
+            Qt.Key.Key_Alt.value,
+            Qt.Key.Key_Shift.value,
+            Qt.Key.Key_Meta.value,
+        ):
+            # Keep tapped modifiers pending until the next key. This supports
+            # both a held chord and the common Ctrl-then-O capture gesture.
+            names = [
+                name for flag, name in (
+                    (Qt.KeyboardModifier.ControlModifier, "Ctrl"),
+                    (Qt.KeyboardModifier.AltModifier, "Alt"),
+                    (Qt.KeyboardModifier.ShiftModifier, "Shift"),
+                    (Qt.KeyboardModifier.MetaModifier, "Meta"),
+                ) if self._held_modifiers & flag.value
+            ]
+            self.setPlaceholderText(" + ".join(names) + " + …" if names else "Press shortcut…")
+            logger.info("[MIDI shortcut capture] modifier released; pending=%s", self._held_modifiers)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
 _AUTOSTART_DIR = _get_autostart_dir()
 
@@ -271,6 +372,7 @@ class SettingsPanel(QGroupBox):
     save_profile_requested = pyqtSignal()  # save current channel state to active profile
     restore_fader_positions_changed = pyqtSignal(bool)  # toggled on/off
     crossfader_enabled_changed = pyqtSignal(bool)  # "Enable A/B crossfader" toggled
+    midi_action_learn_started = pyqtSignal(int, str, str)
 
     def __init__(self, config, connected_port: str | None = None, profile_manager=None, parent=None) -> None:
         from nativmix.metadata import __version__
@@ -360,6 +462,50 @@ class SettingsPanel(QGroupBox):
         midi_opts_layout.addStretch()
 
         root_layout.addLayout(midi_opts_layout)
+
+        # Generic MIDI button actions, separate from per-channel mute Learn.
+        action_group = _CollapsibleGroup("MIDI Button Actions", expanded=False)
+        action_form = QFormLayout(action_group.body)
+        action_form.setContentsMargins(6, 0, 6, 6)
+        self._midi_action_rows = []
+        action_options = [
+            ("Choose action…", ""),
+            ("Stop media", "media_stop"),
+            ("Next track", "media_next"),
+            ("Previous track", "media_previous"),
+            ("Play / pause", "media_play_pause"),
+            ("Keyboard shortcut", "key"),
+        ]
+        for row_index in range(6):
+            row = QHBoxLayout()
+            action = QComboBox()
+            for label, value in action_options:
+                action.addItem(label, value)
+            shortcut = _ShortcutEdit()
+            shortcut.setMaximumWidth(150)
+            shortcut.setToolTip("Enter the key combination to send when this button is pressed.")
+            shortcut.setVisible(False)
+            action.currentIndexChanged.connect(
+                lambda _idx, box=action, edit=shortcut: edit.setVisible(box.currentData() == "key")
+            )
+            action.currentIndexChanged.connect(lambda _idx, idx=row_index: self._update_midi_action_choice(idx))
+            shortcut.shortcut_changed.connect(lambda _text, idx=row_index: self._update_midi_action_choice(idx))
+            status = QLabel("Unassigned")
+            learn = QPushButton("Learn")
+            clear = QPushButton("Clear")
+            row.addWidget(action)
+            row.addWidget(shortcut)
+            row.addWidget(status, 1)
+            row.addWidget(learn)
+            row.addWidget(clear)
+            action_form.addRow(f"Button {row_index + 1}:", row)
+            learn.clicked.connect(
+                lambda _checked=False, idx=row_index, box=action, edit=shortcut:
+                    self._start_midi_action_learn(idx, box.currentData(), edit.text())
+            )
+            clear.clicked.connect(lambda _checked=False, idx=row_index: self._clear_midi_action(idx))
+            self._midi_action_rows.append((action, shortcut, status, learn))
+        root_layout.addWidget(action_group)
 
         # ── USB Port & Autostart ──
         top_layout = QHBoxLayout()
@@ -1225,3 +1371,57 @@ class SettingsPanel(QGroupBox):
         self._profile_next_learn_btn.setText("Learn")
         self._profile_prev_learn_btn.setText("Learn")
         self._profile_direct_learn_btn.setText("Learn")
+
+    def _start_midi_action_learn(self, row: int, action: str, shortcut: str) -> None:
+        logger.info("[MIDI action learn] requested slot=%d action=%r shortcut=%r", row, action, shortcut)
+        if not action:
+            return
+        if action == "key":
+            if not shortcut:
+                self._midi_action_rows[row][2].setText("Enter a shortcut first")
+                return
+            action = f"key:{shortcut}"
+        self._midi_action_rows[row][3].setText("Press button…")
+        self.midi_action_learn_started.emit(row, action, shortcut)
+
+    def _clear_midi_action(self, row: int) -> None:
+        self._midi_action_rows[row][2].setText("Unassigned")
+        self._midi_action_rows[row][3].setText("Learn")
+        self.midi_action_learn_started.emit(row, "", "")
+
+    def _update_midi_action_choice(self, row: int) -> None:
+        action_box, shortcut, _status, _learn = self._midi_action_rows[row]
+        selected = action_box.currentData()
+        if not selected:
+            return
+        action = selected
+        if selected == "key":
+            sequence = shortcut.text()
+            if not sequence:
+                return
+            action = f"key:{sequence}"
+        mappings = self._config.midi_action_mappings
+        for item in mappings:
+            if int(item.get("slot", -1)) == row:
+                item["action"] = action
+                self._config.midi_action_mappings = mappings
+                return
+
+    def update_midi_action_mappings(self, mappings: list[dict]) -> None:
+        """Refresh the learned MIDI CC labels for generic button actions."""
+        by_slot = {int(item.get("slot", -1)): item for item in mappings if isinstance(item, dict)}
+        for idx, (action_box, _shortcut, status, learn) in enumerate(self._midi_action_rows):
+            item = by_slot.get(idx)
+            if not item:
+                status.setText("Unassigned")
+                continue
+            status.setText(f"M{int(item.get('midi_channel', 0)) + 1} / CC {item.get('cc')}")
+            stored_action = str(item.get("action", ""))
+            if stored_action.startswith("key:"):
+                action_box.setCurrentIndex(action_box.findData("key"))
+                _shortcut.setText(stored_action[4:])
+            else:
+                found = action_box.findData(stored_action)
+                if found >= 0:
+                    action_box.setCurrentIndex(found)
+            learn.setText("Learn")

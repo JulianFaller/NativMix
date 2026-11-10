@@ -50,6 +50,12 @@ Example MIDI controller for NativMix with RGB LED feedback.
 
 Assign these CCs in NativMix via MIDI-Learn.
 
+Additional button CCs can be learned under **Settings → MIDI Button Actions**.
+There you can assign stop, next / previous track, play / pause, or a keyboard
+shortcut. On Linux, media actions use `playerctl`; shortcuts use `wtype` on
+Wayland or `xdotool` on X11. Per-channel program mute remains available through
+the channel's **Mute Learn** control.
+
 #### Received from NativMix (LED feedback)
 
 | CC | Value | Function |
