@@ -385,10 +385,16 @@ class ConfigManager(QObject):
                 cc = int(row["cc"])
                 midi_channel = max(0, min(15, int(row.get("midi_channel", 0))))
                 action = str(row["action"])
-                slot = max(0, min(5, int(row.get("slot", len(clean)))))
+                slot = max(0, min(2047, int(row.get("slot", len(clean)))))
             except (KeyError, TypeError, ValueError):
                 continue
-            valid_action = action in {"media_stop", "media_next", "media_previous", "media_play_pause"} or action.startswith("key:")
+            valid_action = action in {
+                "media_stop",
+                "media_next",
+                "media_previous",
+                "media_play_pause",
+                "output_next",
+            } or action.startswith("key:")
             if 0 <= cc <= 127 and valid_action:
                 clean.append({"cc": cc, "midi_channel": midi_channel, "action": action, "slot": slot})
         self._data.setdefault("settings", {})["midi_action_mappings"] = clean

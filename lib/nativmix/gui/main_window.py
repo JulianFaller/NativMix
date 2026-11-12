@@ -1498,6 +1498,7 @@ class MainWindow(QMainWindow):
 
     profile_switch_requested = pyqtSignal(str)  # profile_id
     fader_display_synced = pyqtSignal()
+    midi_output_cycle_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -1808,6 +1809,7 @@ class MainWindow(QMainWindow):
         self.settings_panel.crossfader_enabled_changed.connect(self._on_crossfader_enabled_changed)
         self.settings_panel.master_refresh_requested.connect(self._on_master_refresh)
         self.settings_panel.master_output_changed.connect(self._on_master_changed)
+        self.midi_output_cycle_requested.connect(self._cycle_master_output)
         if self._midi:
             self.settings_panel.midi_panic_triggered.connect(self._midi.restart_midi)
         # ── Initial Population ──
@@ -3250,6 +3252,25 @@ class MainWindow(QMainWindow):
     def _on_master_changed(self, sink_name: str) -> None:
         """Set the new default sink and route loopbacks."""
         self._backend.set_default_sink_and_move_loopbacks(sink_name)
+
+    @pyqtSlot()
+    @_slot_guard
+    def _cycle_master_output(self) -> None:
+        """Switch the system default to the next available real output."""
+        sinks = self._backend.get_real_sinks()
+        if len(sinks) < 2:
+            logger.info("MIDI output cycle ignored: fewer than two real outputs are available")
+            return
+        names = [name for _description, name in sinks]
+        current = self._backend.get_default_sink_name()
+        try:
+            next_index = (names.index(current) + 1) % len(names)
+        except ValueError:
+            next_index = 0
+        target = names[next_index]
+        logger.info("MIDI output cycle: %s → %s", current or "unknown", target)
+        self._backend.set_default_sink_and_move_loopbacks(target)
+        self._on_master_refresh()
 
     # ------------------------------------------------------------------
     # Close → conditionally hide to tray or actually close

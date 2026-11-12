@@ -710,6 +710,9 @@ def main() -> None:
     def _run_midi_action(action: str) -> None:
         """Run a learned Linux media action or keyboard shortcut."""
         logger.info("[MIDI action] received action=%r", action)
+        if action == "output_next":
+            window.midi_output_cycle_requested.emit()
+            return
         media_commands = {
             "media_stop": "stop",
             "media_next": "next",

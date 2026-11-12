@@ -468,43 +468,21 @@ class SettingsPanel(QGroupBox):
         action_form = QFormLayout(action_group.body)
         action_form.setContentsMargins(6, 0, 6, 6)
         self._midi_action_rows = []
-        action_options = [
+        self._midi_action_options = [
             ("Choose action…", ""),
             ("Stop media", "media_stop"),
             ("Next track", "media_next"),
             ("Previous track", "media_previous"),
             ("Play / pause", "media_play_pause"),
+            ("Next output device", "output_next"),
             ("Keyboard shortcut", "key"),
         ]
-        for row_index in range(6):
-            row = QHBoxLayout()
-            action = QComboBox()
-            for label, value in action_options:
-                action.addItem(label, value)
-            shortcut = _ShortcutEdit()
-            shortcut.setMaximumWidth(150)
-            shortcut.setToolTip("Enter the key combination to send when this button is pressed.")
-            shortcut.setVisible(False)
-            action.currentIndexChanged.connect(
-                lambda _idx, box=action, edit=shortcut: edit.setVisible(box.currentData() == "key")
-            )
-            action.currentIndexChanged.connect(lambda _idx, idx=row_index: self._update_midi_action_choice(idx))
-            shortcut.shortcut_changed.connect(lambda _text, idx=row_index: self._update_midi_action_choice(idx))
-            status = QLabel("Unassigned")
-            learn = QPushButton("Learn")
-            clear = QPushButton("Clear")
-            row.addWidget(action)
-            row.addWidget(shortcut)
-            row.addWidget(status, 1)
-            row.addWidget(learn)
-            row.addWidget(clear)
-            action_form.addRow(f"Button {row_index + 1}:", row)
-            learn.clicked.connect(
-                lambda _checked=False, idx=row_index, box=action, edit=shortcut:
-                    self._start_midi_action_learn(idx, box.currentData(), edit.text())
-            )
-            clear.clicked.connect(lambda _checked=False, idx=row_index: self._clear_midi_action(idx))
-            self._midi_action_rows.append((action, shortcut, status, learn))
+        self._midi_action_form = action_form
+        for _ in range(6):
+            self._append_midi_action_row()
+        self._add_midi_action_btn = QPushButton("＋ Add button mapping")
+        self._add_midi_action_btn.clicked.connect(lambda _checked=False: self._append_midi_action_row())
+        action_form.addRow(self._add_midi_action_btn)
         root_layout.addWidget(action_group)
 
         # ── USB Port & Autostart ──
@@ -1384,6 +1362,41 @@ class SettingsPanel(QGroupBox):
         self._midi_action_rows[row][3].setText("Press button…")
         self.midi_action_learn_started.emit(row, action, shortcut)
 
+    def _append_midi_action_row(self) -> None:
+        """Add another learnable MIDI button action row."""
+        row_index = len(self._midi_action_rows)
+        if row_index >= 2048:
+            self._add_midi_action_btn.setEnabled(False)
+            return
+        row = QHBoxLayout()
+        action = QComboBox()
+        for label, value in self._midi_action_options:
+            action.addItem(label, value)
+        shortcut = _ShortcutEdit()
+        shortcut.setMaximumWidth(150)
+        shortcut.setToolTip("Enter a key or key combination to send when this button is pressed.")
+        shortcut.setVisible(False)
+        action.currentIndexChanged.connect(
+            lambda _idx, box=action, edit=shortcut: edit.setVisible(box.currentData() == "key")
+        )
+        action.currentIndexChanged.connect(lambda _idx, idx=row_index: self._update_midi_action_choice(idx))
+        shortcut.shortcut_changed.connect(lambda _text, idx=row_index: self._update_midi_action_choice(idx))
+        status = QLabel("Unassigned")
+        learn = QPushButton("Learn")
+        clear = QPushButton("Clear")
+        row.addWidget(action)
+        row.addWidget(shortcut)
+        row.addWidget(status, 1)
+        row.addWidget(learn)
+        row.addWidget(clear)
+        self._midi_action_form.insertRow(row_index, f"Button {row_index + 1}:", row)
+        learn.clicked.connect(
+            lambda _checked=False, idx=row_index, box=action, edit=shortcut:
+                self._start_midi_action_learn(idx, box.currentData(), edit.text())
+        )
+        clear.clicked.connect(lambda _checked=False, idx=row_index: self._clear_midi_action(idx))
+        self._midi_action_rows.append((action, shortcut, status, learn))
+
     def _clear_midi_action(self, row: int) -> None:
         self._midi_action_rows[row][2].setText("Unassigned")
         self._midi_action_rows[row][3].setText("Learn")
@@ -1410,6 +1423,9 @@ class SettingsPanel(QGroupBox):
     def update_midi_action_mappings(self, mappings: list[dict]) -> None:
         """Refresh the learned MIDI CC labels for generic button actions."""
         by_slot = {int(item.get("slot", -1)): item for item in mappings if isinstance(item, dict)}
+        max_slot = max(by_slot, default=5)
+        while len(self._midi_action_rows) <= max_slot:
+            self._append_midi_action_row()
         for idx, (action_box, _shortcut, status, learn) in enumerate(self._midi_action_rows):
             item = by_slot.get(idx)
             if not item:
